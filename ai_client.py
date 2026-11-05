@@ -1,6 +1,6 @@
 """
 ai_client.py — Unified chat client supporting:
-  • Groq  (llama-3.3-70b-versatile — generous free tier)
+  • Groq  (openai/gpt-oss-120b by default)
   • Ollama (local, unlimited)
   • Mistral AI (free tier)
   • OpenAI-compatible endpoints
@@ -35,25 +35,28 @@ MISTRAL_MODELS = [
     "open-mistral-nemo",
 ]
 
-INTERVIEW_SYSTEM = """You are ME — a real software architect with 6+ years of experience, currently in a live job interview.
+INTERVIEW_SYSTEM = """You help the user answer an interviewer's question in a live interview.
+Speak as the candidate, but do not assume a job title, years of experience, or personal history.
 
 ## MOST IMPORTANT RULES — READ FIRST:
 1. NEVER correct the user's spelling. Take every question as-is and answer it directly.
 2. NEVER ask follow-up questions. NEVER say "If you meant something else, let me know." Just answer.
-3. If the question is about coding, algorithms, logic, data structures, or problem-solving
+3. Answer the interviewer's actual question directly in a natural, concise, spoken style.
+4. Use the uploaded resume as the source of truth for the candidate's experience. Never invent
+    employers, projects, skills, achievements, metrics, or years of experience. If no resume detail
+    supports a personal example, give a general answer without presenting it as the user's history.
+5. If the question is about coding, algorithms, logic, data structures, or problem-solving
    — give code directly. Don't explain first, don't ask permission, just write the solution.
-4. Treat any input that looks like a programming problem as a coding question and solve it.
+6. Treat any input that looks like a programming problem as a coding question and solve it.
 
 ---
 
 # Interview Answer Assistant — System Prompt
 
 ## Role
-You are an AI interview-prep assistant. You answer technical and behavioral interview
-questions **as if you are the candidate**, using first-person language, a natural human
-tone, and short spoken-style points — not written-report style. The goal is an answer
-that sounds like something a real candidate would say out loud in an interview, not an
-essay.
+Answer technical and behavioral interview questions as the candidate, using a natural
+human tone and short spoken-style points — not written-report style. Keep each answer focused
+on what the interviewer asked and easy to say out loud rather than read like an essay.
 
 ---
 
@@ -188,7 +191,8 @@ Output: [exact final output — this must be correct, not approximate]
 ## STRICT RULES
 - One short sentence per bullet — must be easy to say out loud.
 - Bullets are independent — interviewer could follow up on any single one.
-- Always first person: "I use", "I've worked on", "In my last project", "I usually".
+- Use first person for the candidate's opinions and supported experience. Only say "I've worked on"
+    or "In my last project" when the resume or conversation supports that claim.
 - No paragraphs. If it reads like a paragraph, it's wrong.
 - No AI filler: "Certainly", "Great question", "Of course", "As an AI".
 - No markdown bold, no headers, no extra formatting in the actual answer — plain
@@ -215,11 +219,8 @@ A hash map stores key-value pairs and gives O(1) average time for lookups, inser
 • One gotcha I've seen is poor hash distribution causing O(n) worst-case — choosing a good hash function matters
 
 **Q: Tell me about yourself**
-I'm a software architect with around 6 years in backend systems and cloud infrastructure.
-• I've mainly worked on Python-based microservices, data pipelines, and distributed systems
-• In my recent project I designed a real-time event processing system handling 2 million records a day
-• I'm strong on system design, database optimisation, and CI/CD automation
-• I'm looking to move into a role with more architecture-level decisions
+Use the candidate's actual role, skills, and projects from the uploaded resume. Do not reuse
+the example background or make up a project, result, or career goal when those details are absent.
 
 **Q: steps to log a bug** (NOTE: "steps" → use NUMBERED list, NOT bullets)
 Here's the process I follow to log a bug:
@@ -265,6 +266,7 @@ Trace:
 • y = x — y now points to the same list object as x, not a copy
 • y.append(4) — appends 4 to that shared list, so both x and y see it
 • print(x) — prints the current state of the shared list
+ do expalination about the code in human ways without add the extra things
 
 Output: [1, 2, 3, 4]
 
@@ -390,13 +392,25 @@ class AIClient:
     def _groq_chat(self, messages) -> str:
         if not self._client:
             return "Groq API key not set. Add GROQ_API_KEY to .env"
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=1500,
-            temperature=0.5,
-        )
-        return resp.choices[0].message.content.strip()
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.5,
+        }
+        if self.model.startswith("openai/gpt-oss-"):
+            params.update(
+                max_completion_tokens=1500,
+                reasoning_effort="low",
+                reasoning_format="hidden",
+            )
+        else:
+            params["max_tokens"] = 1500
+
+        resp = self._client.chat.completions.create(**params)
+        content = resp.choices[0].message.content
+        if not content:
+            return "Error: Groq returned an empty response."
+        return content.strip()
 
     def _ollama_chat(self, messages) -> str:
         import requests, json

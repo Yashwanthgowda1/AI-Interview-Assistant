@@ -1,49 +1,59 @@
 """
 meeting_listener.py — Real-time loopback audio capture + transcription.
-Transcribes every CHUNK_SECONDS seconds while recording and calls on_text().
+Transcribes audio locally with faster-whisper every CHUNK_SECONDS seconds and
+calls on_text().
 """
 from __future__ import annotations
-import io, logging, threading, wave
+import logging, threading
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE   = 16000
 CHUNK_SECONDS = 5   # transcribe every N seconds of audio
 
+_whisper_model = None
+_whisper_model_lock = threading.Lock()
+_transcription_lock = threading.Lock()
 
-def _pcm_to_wav_bytes(samples_float32, sample_rate: int) -> bytes:
-    import numpy as np
-    pcm16 = (samples_float32 * 32767).clip(-32768, 32767).astype("<i2")
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm16.tobytes())
-    return buf.getvalue()
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_model_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+
+                logger.info("Loading local faster-whisper base model")
+                _whisper_model = WhisperModel(
+                    "base",
+                    device="cpu",
+                    compute_type="int8",
+                )
+    return _whisper_model
 
 
 def _transcribe_chunk(samples, language: str) -> str:
     import numpy as np
-    import speech_recognition as sr
 
     peak = float(np.max(np.abs(samples)))
     if peak < 0.002:
         return ""
 
     gain = min(0.8 / peak, 6.0)
-    samples = (samples * gain).clip(-1.0, 1.0)
+    samples = (samples * gain).clip(-1.0, 1.0).astype(np.float32)
+    model = _get_whisper_model()
+    language_code = language.split("-", 1)[0].strip() or None
 
-    wav_bytes = _pcm_to_wav_bytes(samples, SAMPLE_RATE)
-    recognizer = sr.Recognizer()
-    try:
-        audio = sr.AudioData(wav_bytes, SAMPLE_RATE, 2)
-        return recognizer.recognize_google(audio, language=language).strip()
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError as e:
-        logger.error("Google SR error: %s", e)
-        return ""
+    # Audio chunks are flushed on separate threads, so serialize model inference.
+    with _transcription_lock:
+        segments, _ = model.transcribe(
+            samples,
+            language=language_code,
+            beam_size=1,
+            vad_filter=True,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 def _capture_pyaudiowpatch(stop_event, on_chunk):
@@ -134,23 +144,35 @@ class MeetingListener(threading.Thread):
     on_text(str) is called on the calling thread via the provided callback.
     """
 
-    def __init__(self, on_text=None, language: str = "en-US"):
+    def __init__(
+        self,
+        on_text: Optional[Callable[[str], None]] = None,
+        language: str = "en-US",
+        on_error: Optional[Callable[[str], None]] = None,
+    ):
         super().__init__(daemon=True)
         self.language = language
-        self.on_text  = on_text          # callback(text: str)
-        self._stop    = threading.Event()
+        self.on_text = on_text
+        self.on_error = on_error
+        self._stop_event = threading.Event()
         self._buffer: list = []          # raw 1-second float32 chunks
         self._lock    = threading.Lock()
+        self._transcription_error_reported = False
+
+    def _report_error(self, message: str):
+        logger.error("%s", message)
+        if self.on_error:
+            self.on_error(message)
 
     def start_listening(self):
-        self._stop.clear()
+        self._stop_event.clear()
         with self._lock:
             self._buffer.clear()
         if not self.is_alive():
             self.start()
 
     def stop_listening(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def _flush_buffer(self):
         """Transcribe whatever is in the buffer and fire the callback."""
@@ -161,14 +183,24 @@ class MeetingListener(threading.Thread):
             samples = np.concatenate(self._buffer)
             self._buffer.clear()
 
-        text = _transcribe_chunk(samples, self.language)
+        try:
+            text = _transcribe_chunk(samples, self.language)
+            self._transcription_error_reported = False
+        except Exception as exc:
+            if not self._transcription_error_reported:
+                message = f"Meeting transcription failed: {exc}"
+                if isinstance(exc, ImportError):
+                    message += ". Install dependencies from requirements.txt and restart listening."
+                self._report_error(message)
+                self._transcription_error_reported = True
+            self._stop_event.set()
+            return
+
         logger.info("Transcribed: %s", text or "<silent>")
         if text and self.on_text:
             self.on_text(text)
 
     def run(self):
-        import numpy as np
-
         seconds_accumulated = 0
 
         def on_chunk(samples):
@@ -181,19 +213,21 @@ class MeetingListener(threading.Thread):
                 threading.Thread(target=self._flush_buffer, daemon=True).start()
 
         try:
-            _capture_pyaudiowpatch(self._stop, on_chunk)
+            _capture_pyaudiowpatch(self._stop_event, on_chunk)
         except ImportError:
             logger.warning("pyaudiowpatch not available, trying soundcard…")
             try:
-                _capture_soundcard(self._stop, on_chunk)
+                _capture_soundcard(self._stop_event, on_chunk)
             except Exception as exc:
                 logger.exception("Audio capture failed: %s", exc)
+                self._report_error(f"Meeting audio capture failed: {exc}")
         except Exception as exc:
             logger.warning("pyaudiowpatch failed (%s), trying soundcard…", exc)
             try:
-                _capture_soundcard(self._stop, on_chunk)
+                _capture_soundcard(self._stop_event, on_chunk)
             except Exception as exc2:
                 logger.exception("Both audio backends failed: %s", exc2)
+                self._report_error(f"Meeting audio capture failed: {exc2}")
         # flush any remaining audio when stopped
         self._flush_buffer()
         logger.info("Meeting listener stopped")

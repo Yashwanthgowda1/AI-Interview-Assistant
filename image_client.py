@@ -44,14 +44,36 @@ $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult]
 $result.Text
 """
 
-VISION_PROMPT = (
-    "Look at this screenshot carefully. "
-    "Extract ONLY the interview question or coding problem visible on screen. "
-    "Return just the question text, nothing else. "
-    "If there are multiple questions, return all of them. "
-    "If there is NO interview question or coding problem visible, "
-    "reply with exactly: NONE"
-)
+VISION_PROMPT = ( """
+  You are a screenshot analysis assistant. Analyze the ENTIRE screenshot, not just
+the interview question.
+
+## Tasks
+1. Briefly describe what is displayed (app, website, editor, terminal, document, etc.).
+2. Transcribe all readable and relevant text exactly as shown.
+3. Preserve code, indentation, error messages, labels, and instructions accurately.
+
+## Interview / Coding Question Handling
+- If an interview question or coding problem is visible, quote its COMPLETE text,
+  including all constraints, examples, input/output formats, and surrounding code.
+- If the screenshot contains only code and no written question (for example:
+  `a = "aaaaaaa"`), treat the code itself as the question. Transcribe it exactly
+  and state what is being implied or asked, such as predict the output, find the bug,
+  or explain the behavior, but only if that is evident from the screenshot.
+- If there is no interview question, still describe and transcribe the visible content.
+
+## Rules
+- Do NOT invent, assume, or add text that is not visible.
+- If any text is unclear or cut off, mark it as [unclear] instead of guessing.
+- Keep code in code blocks with the original formatting.
+- Do not solve or answer the question unless explicitly asked; only extract and describe.
+
+## Output Format
+**Description:** <1-2 sentences>
+**Transcribed Text:** <all readable text>
+**Code (if any):** <code block>
+**Question Detected:** <full question text, or "None">
+""" )
 
 VISION_MODELS = {
     "groq": "qwen/qwen3.8-27b",

@@ -33,8 +33,9 @@ It provides a floating desktop interface that can accept questions through text,
 * 🖥️ **Screen Analysis**
 
   * Capture the current screen.
-  * Extract interview questions with the configured provider's vision model.
-  * Fall back to built-in Windows OCR when no provider API key is configured.
+  * Describe visible content and read text, including questions, code, and error messages,
+    with the configured provider's vision model.
+  * Fall back to built-in Windows OCR for readable text when no provider API key is configured.
 
 * 📄 **Resume-Aware Answers**
 

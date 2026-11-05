@@ -132,6 +132,10 @@ class ScreenAnalysisWorker(QThread):
                 model=self.model,
                 ollama_url=self.ollama_url,
             )
+            if not text.strip() or text.strip().upper().startswith("NONE"):
+                text = extract_text_offline(self.image)
+                self.offline_text_extracted.emit(text)
+                return
             self.question_extracted.emit(text)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -598,7 +602,9 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(send_btn, 2)
 
         screen_btn = QPushButton("📷 Analyse Screen")
-        screen_btn.setToolTip("Capture screen — AI reads the question automatically")
+        screen_btn.setToolTip(
+            "Describe the visible screen and read its text, including questions and code"
+        )
         screen_btn.clicked.connect(self._analyse_screen)
         btn_row.addWidget(screen_btn, 2)
 

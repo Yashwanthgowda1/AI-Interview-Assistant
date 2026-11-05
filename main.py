@@ -12,7 +12,7 @@ Features:
   • Global hotkey  Ctrl+Shift+Space  to show/hide
 """
 from __future__ import annotations
-import sys, os, logging, threading, html
+import sys, os, logging, threading, html, faulthandler
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QLineEdit, QPushButton, QLabel, QComboBox, QFrame,
     QSizePolicy, QSplitter, QScrollArea, QDialog, QFormLayout,
     QDialogButtonBox, QCheckBox, QSpinBox, QTabWidget, QGroupBox,
-    QToolButton, QStatusBar, QFileDialog,
+    QToolButton, QStatusBar, QFileDialog, QMenu,
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QPoint,
@@ -41,6 +41,7 @@ from image_client import capture_screen, pil_to_qpixmap
 from resume_client import parse_resume, summarise_for_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+faulthandler.enable()
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +91,12 @@ class AnswerWorker(QThread):
                 self.status_update.emit("Thinking…")
             answer = self.ai.chat(self.question, context=context,
                                   resume=self.resume, history=self.history)
-            self.answer_ready.emit(answer)
+            if answer.startswith(("Error:", "Groq API key not set.", "Mistral API key not set.",
+                                  "OpenAI API key not set.", "Unknown provider selected.",
+                                  "Model '")):
+                self.error.emit(answer)
+            else:
+                self.answer_ready.emit(answer)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -100,17 +106,32 @@ class AnswerWorker(QThread):
 # ─────────────────────────────────────────────────────────────────────────────
 class ScreenAnalysisWorker(QThread):
     question_extracted = pyqtSignal(str)
+    offline_text_extracted = pyqtSignal(str)
     error              = pyqtSignal(str)
 
-    def __init__(self, image, api_key: str):
+    def __init__(self, image, provider: str, api_key: str, model: str, ollama_url: str):
         super().__init__()
-        self.image   = image
+        self.image = image
+        self.provider = provider
         self.api_key = api_key
+        self.model = model
+        self.ollama_url = ollama_url
 
     def run(self):
         try:
-            from image_client import extract_question_from_screen
-            text = extract_question_from_screen(self.image, self.api_key)
+            from image_client import extract_question_from_screen, extract_text_offline
+            if self.provider != "ollama" and not self.api_key.strip():
+                text = extract_text_offline(self.image)
+                self.offline_text_extracted.emit(text)
+                return
+
+            text = extract_question_from_screen(
+                self.image,
+                self.provider,
+                api_key=self.api_key,
+                model=self.model,
+                ollama_url=self.ollama_url,
+            )
             self.question_extracted.emit(text)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -133,6 +154,7 @@ Reply with EXACTLY one word: YES or NO"""
 class MeetingFilterWorker(QThread):
     is_question  = pyqtSignal(str)   # emits original text if it IS a question
     not_question = pyqtSignal(str)   # emits text if it is NOT a question
+    error        = pyqtSignal(str)
 
     def __init__(self, text: str, ai: AIClient, resume: str, use_web: bool):
         super().__init__()
@@ -147,15 +169,23 @@ class MeetingFilterWorker(QThread):
                 self.text,
                 system=QUESTION_FILTER_PROMPT,
                 resume=""
-            ).strip().upper()
+            ).strip()
 
-            if verdict.startswith("YES"):
+            if not verdict:
+                self.error.emit("AI question filter returned an empty response.")
+                return
+
+            if verdict.startswith(("Error:", "Groq API key not set.", "Mistral API key not set.",
+                                   "OpenAI API key not set.", "Unknown provider selected.")):
+                self.error.emit(verdict)
+                return
+
+            if verdict.upper().startswith("YES"):
                 self.is_question.emit(self.text)
             else:
                 self.not_question.emit(self.text)
-        except Exception:
-            # On error, assume it is a question so nothing is missed
-            self.is_question.emit(self.text)
+        except Exception as exc:
+            self.error.emit(f"Meeting question filter failed: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,6 +193,7 @@ class MeetingFilterWorker(QThread):
 # ─────────────────────────────────────────────────────────────────────────────
 class _MeetingTextSignal(QThread):
     text_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
     def run(self): pass
 
 
@@ -280,6 +311,8 @@ QTextEdit, QLineEdit {
     border-radius: 6px;
     padding: 6px;
     color: #e0e0e0;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
 }
 QPushButton {
     background-color: #0f3460;
@@ -350,8 +383,11 @@ QScrollBar::handle:vertical {
 
 
 class MainWindow(QMainWindow):
+    _visibility_toggle_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
+        self._visibility_toggle_requested.connect(self._toggle_visibility)
         _provider = os.getenv("AI_PROVIDER", "groq")
         _key_map = {
             "groq":    os.getenv("GROQ_API_KEY", ""),
@@ -369,10 +405,13 @@ class MainWindow(QMainWindow):
         self.meeting_listener: Optional[MeetingListener] = None
         self.meeting_active = False
         self.worker: Optional[AnswerWorker] = None
+        self._answer_workers: set[AnswerWorker] = set()
+        self._screen_worker: Optional[ScreenAnalysisWorker] = None
         self._drag_pos: Optional[QPoint] = None
         self._stealth_on = True
         self._chat_history: list[tuple[str, str]] = []
         self._resume_text: str = ""
+        self._last_answer: str = ""
 
         self._build_ui()
         self._setup_hotkey_timer()
@@ -510,10 +549,28 @@ class MainWindow(QMainWindow):
         self._update_provider_indicator()
         root.addWidget(self.provider_indicator)
 
+        chat_actions = QHBoxLayout()
+        chat_actions.addWidget(QLabel("Conversation"))
+        chat_actions.addStretch()
+
+        self.copy_answer_btn = QPushButton("Copy latest answer")
+        self.copy_answer_btn.setToolTip("Copy the latest answer exactly, including code")
+        self.copy_answer_btn.setEnabled(False)
+        self.copy_answer_btn.clicked.connect(self._copy_latest_answer)
+        chat_actions.addWidget(self.copy_answer_btn)
+
+        copy_chat_btn = QPushButton("Copy conversation")
+        copy_chat_btn.setToolTip("Copy all visible conversation text")
+        copy_chat_btn.clicked.connect(self._copy_conversation)
+        chat_actions.addWidget(copy_chat_btn)
+        root.addLayout(chat_actions)
+
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setMinimumHeight(380)
         self.chat_display.setPlaceholderText("Answers will appear here…")
+        self.chat_display.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chat_display.customContextMenuRequested.connect(self._show_chat_context_menu)
         root.addWidget(self.chat_display, 3)
 
         # ── input row ────────────────────────────────────────────
@@ -696,20 +753,25 @@ class MainWindow(QMainWindow):
         question = self.question_input.text().strip()
         if not question:
             return
+        self._submit_question(question, "You")
+        self.question_input.clear()
+
+    def _submit_question(self, question: str, source: str):
+        question = question.strip()
+        if not question:
+            return
+
         # apply any key typed in the field that hasn't been committed yet
         typed_key = self.api_key_input.text().strip()
         if typed_key and typed_key != self.ai.api_key:
             self.ai.api_key = typed_key
             self.ai._setup()
-        self.question_input.clear()
+
         self._chat_history.append(("user", question))
-        self._append_chat("You", question, "#61dafb")
+        self._append_chat(source, question, "#61dafb")
         self._run_worker(question)
 
     def _run_worker(self, question: str):
-        if self.worker and self.worker.isRunning():
-            self.worker.quit()
-
         self.status_bar.showMessage(f"Using: {self.ai.provider} / {self.ai.model}")
 
         # pass last 4 exchanges (8 messages) so the AI has context without exceeding token limits
@@ -718,16 +780,58 @@ class MainWindow(QMainWindow):
             resume=self._resume_text,
             history=self._chat_history[-8:],
         )
+        worker = self.worker
+        self._answer_workers.add(worker)
         self.worker.answer_ready.connect(self._on_answer)
-        self.worker.status_update.connect(lambda s: self.status_bar.showMessage(s))
-        self.worker.error.connect(lambda e: self._append_chat("Error", e, "#e94560"))
-        self.worker.finished.connect(lambda: self.status_bar.showMessage("Ready"))
+        self.worker.status_update.connect(self._on_answer_status)
+        self.worker.error.connect(self._on_answer_error)
+        self.worker.finished.connect(lambda worker=worker: self._on_answer_worker_finished(worker))
         self.worker.start()
         self.status_bar.showMessage("Processing…")
 
+    def _on_answer_status(self, message: str):
+        self.status_bar.showMessage(message)
+
+    def _on_answer_error(self, message: str):
+        self._append_chat("Error", message, "#e94560")
+        self.status_bar.showMessage(f"Answer error: {message[:100]}")
+
+    def _on_answer_worker_finished(self, worker: AnswerWorker):
+        self._answer_workers.discard(worker)
+        if not self._answer_workers:
+            self.status_bar.showMessage("Ready")
+
     def _on_answer(self, text: str):
+        self._last_answer = text
+        self.copy_answer_btn.setEnabled(True)
         self._append_chat("Assistant", text, "#98c379")
         self._chat_history.append(("assistant", text))
+
+    def _show_chat_context_menu(self, position):
+        menu = QMenu(self.chat_display)
+        copy_selected = menu.addAction("Copy selected text")
+        copy_selected.setEnabled(self.chat_display.textCursor().hasSelection())
+        copy_selected.triggered.connect(self.chat_display.copy)
+        copy_latest = menu.addAction("Copy latest answer")
+        copy_latest.setEnabled(bool(self._last_answer))
+        copy_latest.triggered.connect(self._copy_latest_answer)
+        menu.addAction("Copy conversation", self._copy_conversation)
+        menu.exec_(self.chat_display.mapToGlobal(position))
+
+    def _copy_latest_answer(self):
+        if not self._last_answer:
+            self.status_bar.showMessage("There is no answer to copy")
+            return
+        QApplication.clipboard().setText(self._last_answer)
+        self.status_bar.showMessage("Latest answer copied")
+
+    def _copy_conversation(self):
+        text = self.chat_display.toPlainText()
+        if not text:
+            self.status_bar.showMessage("There is no conversation to copy")
+            return
+        QApplication.clipboard().setText(text)
+        self.status_bar.showMessage("Conversation copied")
 
     # ── voice ────────────────────────────────────────────────────
     def _toggle_voice(self):
@@ -784,8 +888,10 @@ class MainWindow(QMainWindow):
     def _start_meeting(self):
         self._meeting_signal = _MeetingTextSignal()
         self._meeting_signal.text_ready.connect(self._on_meeting_text)
+        self._meeting_signal.error_ready.connect(self._on_meeting_listener_error)
         self.meeting_listener = MeetingListener(
-            on_text=lambda t: self._meeting_signal.text_ready.emit(t)
+            on_text=lambda t: self._meeting_signal.text_ready.emit(t),
+            on_error=lambda message: self._meeting_signal.error_ready.emit(message),
         )
         self.meeting_listener.start_listening()
         self.meeting_active = True
@@ -806,20 +912,45 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Meeting listener stopped")
 
     def _on_meeting_text(self, text: str):
+        self._append_chat("Interviewer", text, "#f0a500")
         worker = MeetingFilterWorker(text, self.ai, self._resume_text, self.web_chk.isChecked())
         worker.is_question.connect(self._on_meeting_question)
-        worker.not_question.connect(lambda t: self.status_bar.showMessage(f"Heard (not a question): {t[:50]}"))
+        worker.not_question.connect(self._on_meeting_not_question)
+        worker.error.connect(self._on_meeting_filter_error)
         worker.start()
         self._meeting_workers = getattr(self, "_meeting_workers", [])
         self._meeting_workers.append(worker)
 
     def _on_meeting_question(self, text: str):
-        self._append_chat("Interviewer", text, "#f0a500")
         self.status_bar.showMessage(f"Question detected: {text[:60]}")
         self._run_worker(text)
+        self._chat_history.append(("user", text))
+
+    def _on_meeting_not_question(self, text: str):
+        self.status_bar.showMessage(f"Heard (not a question): {text[:80]}")
+
+    def _on_meeting_listener_error(self, message: str):
+        if self.meeting_active:
+            self._stop_meeting()
+        self._append_chat("Meeting error", message, "#e94560")
+        self.status_bar.showMessage(f"Meeting error: {message[:100]}")
+
+    def _on_meeting_filter_error(self, message: str):
+        self._append_chat("Meeting error", message, "#e94560")
+        self.status_bar.showMessage(f"AI question filter error: {message[:100]}")
 
     # ── screen analysis ──────────────────────────────────────────
     def _analyse_screen(self):
+        if self._screen_worker and self._screen_worker.isRunning():
+            self.status_bar.showMessage("Screen analysis is already running")
+            return
+
+        self.ai.model = self.model_cb.currentText().strip()
+        api_key = self.api_key_input.text().strip()
+        if api_key != self.ai.api_key:
+            self.ai.api_key = api_key
+            self.ai._setup()
+
         self.status_bar.showMessage("Capturing screen…")
         self.hide()
         QApplication.processEvents()
@@ -830,25 +961,54 @@ class MainWindow(QMainWindow):
         self.raise_()
 
         if img is None:
-            self.status_bar.showMessage("Screenshot failed")
+            self._on_screen_analysis_error(
+                "Screenshot capture failed. Check the application log for details."
+            )
             return
 
-        self.status_bar.showMessage("AI is reading the screen…")
-        self._screen_worker = ScreenAnalysisWorker(img, self.ai.api_key)
-        self._screen_worker.question_extracted.connect(self._on_screen_question)
-        self._screen_worker.error.connect(
-            lambda e: self.status_bar.showMessage(f"Vision error: {e}")
+        status = (
+            "Reading screen locally…"
+            if self.ai.provider != "ollama" and not api_key
+            else "AI is reading the screen…"
         )
+        self.status_bar.showMessage(status)
+        self._screen_worker = ScreenAnalysisWorker(
+            img,
+            self.ai.provider,
+            self.ai.api_key,
+            self.ai.model,
+            self.ai.ollama_url,
+        )
+        self._screen_worker.question_extracted.connect(self._on_screen_question)
+        self._screen_worker.offline_text_extracted.connect(self._on_offline_screen_text)
+        self._screen_worker.error.connect(self._on_screen_analysis_error)
         self._screen_worker.start()
+
+    def _on_offline_screen_text(self, text: str):
+        extracted = text.strip()
+        if not extracted:
+            self._on_screen_analysis_error("No readable text was found on the screen.")
+            return
+
+        self.question_input.setText(extracted)
+        self._append_chat("Screen", extracted, "#a78bfa")
+        self.status_bar.showMessage(
+            "Screen text extracted offline. Add an API key and press Send for an AI answer."
+        )
+
+    def _on_screen_analysis_error(self, message: str):
+        logger.error("Screen analysis failed: %s", message)
+        self._append_chat("Screen analysis error", message, "#e94560")
+        self.status_bar.showMessage(f"Screen analysis failed: {message[:100]}")
 
     def _on_screen_question(self, question: str):
         q = question.strip()
         if not q or q.upper() == "NONE" or q.upper().startswith("NONE"):
             self.status_bar.showMessage("No question found on screen")
             return
-        self._append_chat("Screen", question, "#f0a500")
-        self.question_input.setText(question)
-        self._run_worker(question)
+        logger.info("Screen question extracted (%d characters)", len(q))
+        self.question_input.setText(q)
+        self._submit_question(q, "Screen")
 
     # ── chat display helpers ─────────────────────────────────────
     def _append_chat(self, role: str, text: str, color: str = "#e0e0e0"):
@@ -959,6 +1119,8 @@ class MainWindow(QMainWindow):
     def _clear(self):
         self.chat_display.clear()
         self._chat_history.clear()
+        self._last_answer = ""
+        self.copy_answer_btn.setEnabled(False)
         self.question_input.clear()
 
     # ── global hotkey (Ctrl+Shift+Space) ─────────────────────────
@@ -988,8 +1150,7 @@ class MainWindow(QMainWindow):
             logger.warning("pynput not installed — global hotkey disabled")
 
     def _hotkey_triggered(self):
-        # Must marshal to GUI thread
-        QTimer.singleShot(0, self._toggle_visibility)
+        self._visibility_toggle_requested.emit()
 
     def _toggle_visibility(self):
         if self.isVisible():
@@ -1013,11 +1174,18 @@ class MainWindow(QMainWindow):
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
 
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        self.status_bar.showMessage("Assistant hidden — Ctrl+Shift+Space to show")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Interview Assistant")
+    app.setQuitOnLastWindowClosed(False)
+    app.aboutToQuit.connect(lambda: logger.info("Application is shutting down"))
     win = MainWindow()
     # Position bottom-right by default
     screen = app.primaryScreen().availableGeometry()

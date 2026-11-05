@@ -28,11 +28,13 @@ It provides a floating desktop interface that can accept questions through text,
     * Zoom
     * Google Meet
     * Microsoft Teams
+  * Transcribe locally with faster-whisper; the model is downloaded on first use.
 
 * 🖥️ **Screen Analysis**
 
   * Capture the current screen.
-  * Extract interview questions directly from the screen.
+  * Extract interview questions with the configured provider's vision model.
+  * Fall back to built-in Windows OCR when no provider API key is configured.
 
 * 📄 **Resume-Aware Answers**
 
@@ -119,7 +121,9 @@ python --version
 
 ### AI Provider
 
-You need at least one of:
+An AI provider is needed for AI-generated answers and cloud-based screen analysis.
+Screen text can still be extracted offline with Windows OCR when no API key is set.
+For AI features, configure at least one of:
 
 * Groq API key
 * OpenAI API key
@@ -326,7 +330,10 @@ Click:
 Analyse Screen
 ```
 
-The application captures the screen and uses vision-based analysis to identify the question.
+With a configured provider API key, the application uses that provider's vision model
+to extract the question and generate an answer. Without an API key, Windows OCR extracts
+visible text locally and places it in the question field; review it and press **Send**
+to get an AI answer after configuring a provider.
 
 This is useful for questions displayed in:
 
@@ -365,7 +372,9 @@ Enable:
 Meeting
 ```
 
-The application can capture supported system/loopback audio and transcribe the conversation.
+The application captures supported system/loopback audio and transcribes it locally with
+faster-whisper. The base model is downloaded the first time meeting transcription starts;
+subsequent transcription runs locally without sending audio to a speech-recognition service.
 
 Supported meeting applications can include:
 
